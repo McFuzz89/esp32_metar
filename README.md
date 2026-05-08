@@ -26,7 +26,7 @@
  * Install the libraries
  * Configure the IDE per the below screenshots.
  * Connect display via USB-C
- * Paste the code. You can edit the code before deployment to add your own airports - or can do it after using the UI. 
+ * Paste the code. You can edit the code before deployment to add your own airports - or can do it after using the UI.
  * Deploy!
 
    After deployment, the display may go straight into wifi selection mode; follow the instructions on the screen - you can use a phone to connect to the WiFi network shown on the display which will open a captive portal page allowing you to select and connect to your network. Once that is done, enter the configuration menu (top button 3 second press), then on your computer or phone open a web browser and enter the IP address shown on the display to enter the configuration menu (see screenshot at the bottom of the Readme). 
