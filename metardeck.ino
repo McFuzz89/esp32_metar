@@ -18,7 +18,7 @@ String mySSID = "";
 String myPASS = "";
 
 String airports[10]; 
-String tafFallbacks[10]; // V32.9: New TAF Fallback Array
+String tafFallbacks[10]; 
 String runways[10]; 
 const int numAirports = 10; 
 int currentIdx = 0;
@@ -347,7 +347,7 @@ void loadPreferences() {
   myPASS = prefs.getString("wifi_pass", "YOUR_WIFI_PASSWORD");
 
   String defApts[] = {"KLVK", "KTCY", "KSCK", "KMOD", "KCCR", "KRHV", "KC83", "KSJC", "KOAK", "KPAO"};
-  String defTafs[] = {"", "KSCK", "", "", "", "KSJC", "KLVK", "", "", "KSJC"}; // Default fallback routing
+  String defTafs[] = {"", "KSCK", "", "", "", "KSJC", "KLVK", "", "", "KSJC"}; 
   String defRwys[] = {"25R/25L, 07L/07R", "26, 08", "29R/29L, 11L/11R", "28R/28L, 10R/10L", "19R/19L, 01R/01L", "31R/31L, 13R/13L", "30, 12", "30L/30R, 12R/12L", "30, 12", "31, 13"};
   
   for (int i=0; i<numAirports; i++) {
@@ -657,9 +657,7 @@ void fetchMETAR(String icao) {
     JsonObject obj = doc[0];
 
     const char* cat = obj["fltCat"] | "UNK";
-    
     String vis = obj["visib"].isNull() ? "N/A" : obj["visib"].as<String>();
-    
     const char* raw = obj["rawOb"] | "";
     String name = obj["name"] | "Unknown Station";
     float temp = obj["temp"] | 0.0;
@@ -732,6 +730,14 @@ void fetchMETAR(String icao) {
       drawWaterDrop(400 + bw + 15, 142, 7); 
       
       String rawStr = String(raw);
+      
+      // --- V32.10 BUGFIX: Strip out the remarks section for weather icon parsing ---
+      String iconStr = rawStr; 
+      int rmkIdx = iconStr.indexOf(" RMK");
+      if (rmkIdx > 0) {
+        iconStr = iconStr.substring(0, rmkIdx); 
+      }
+
       String cloudStr = "";
       JsonArray clouds = obj["clouds"];
       if (clouds.size() == 0) {
@@ -751,7 +757,9 @@ void fetchMETAR(String icao) {
 
       int iconX = 460; 
       if (cloudStr.length() > 20) iconX = 550; 
-      drawWeatherIcon(iconX, 200, rawStr, (ti.tm_hour >= 19 || ti.tm_hour < 6));
+      
+      // Pass the cleaned iconStr instead of the full rawStr
+      drawWeatherIcon(iconX, 200, iconStr, (ti.tm_hour >= 19 || ti.tm_hour < 6));
       
       drawCompass(660, 160, 65, wdir, wspd, wgst);
       drawWindsock(750, 40, wdir, wspd);
@@ -771,9 +779,8 @@ void fetchTAF(String icao) {
   HTTPClient http;
   int httpCode = -1;
   
-  // V32.9: Read fallback from memory instead of hardcoded list
   String target = tafFallbacks[currentIdx];
-  if (target == "") target = icao; // Fall back to itself if blank
+  if (target == "") target = icao; 
 
   http.begin("https://aviationweather.gov/api/data/taf?ids=" + target + "&format=json");
   http.setUserAgent("MFD-FlightDeck/1.0 (your_email@example.com)");
@@ -1015,7 +1022,7 @@ void drawWeatherIcon(int x, int y, String raw, bool isNight) {
     
     int cloudBelly = y + 26;
     int len = 15; 
-    int ang = -15; 
+    int ang = 15; // V32.10: Updated to 15 degrees for forward slashes "\"
 
     drawEinkSlash(x - 22, cloudBelly + 3, len, ang);
     drawEinkSlash(x - 12, cloudBelly + 6, len, ang);
