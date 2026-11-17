@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <SPI.h>
@@ -20,13 +21,15 @@ String myPASS = "";
 String airports[10]; 
 String tafFallbacks[10]; 
 String runways[10]; 
+float aptLat[10] = {0};
+float aptLon[10] = {0};
 const int numAirports = 10; 
 int currentIdx = 0;
 int weatherMode = 0; // 0=METAR, 1=TAF, 2=WINDS
 
 bool inConfigMode = false;
 bool inWifiSetup = false;
-int lastFetchMinute = -1; 
+int lastFetchSlot = -1; 
 bool invertedColors = false; 
 unsigned long lastFetchTime = 0;
 unsigned long lastInteraction = 0; 
@@ -65,17 +68,6 @@ Preferences prefs;
 
 GxEPD2_BW<GxEPD2_579_GDEY0579T93, GxEPD2_579_GDEY0579T93::HEIGHT> display(GxEPD2_579_GDEY0579T93(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 
-// --- FB STATION DICTIONARY ---
-struct FBStation { String id; float lat; float lon; };
-FBStation fbStations[] = {
-  {"SFO", 37.6190, -122.3748},
-  {"SAC", 38.5125, -121.4934},
-  {"FAT", 36.7761, -119.7181},
-  {"RBL", 40.1523, -122.2520},
-  {"UKI", 39.1256, -123.2007},
-  {"BFL", 35.4336, -119.0567}
-};
-
 // Forward Declarations
 void loadPreferences();
 void enterConfigMode();
@@ -99,12 +91,12 @@ void drawWaterDrop(int x, int y, int r);
 void drawBattery(int x, int y);
 void drawErrorScreen(String icao, String type, int httpCode);
 void printWithDegree(int x, int y, const char* label, float val);
+void printWindDecoded(int x, int y, int dir, int spd);
+String formatFAAWind(int dir, int spd, float temp);
 String expandCover(String c);
 String expandWx(String w);
 String getBestRunway(String icao, int wdir, int aptIdx); 
 String formatAlt(int feet);
-float getDistance(float lat1, float lon1, float lat2, float lon2);
-String getClosestFB(float lat, float lon);
 
 void setup() {
   Serial.begin(115200);
@@ -126,7 +118,7 @@ void setup() {
   }
   
   WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+  WiFi.setTxPower(WIFI_POWER_15dBm); 
   WiFi.begin(mySSID.c_str(), myPASS.c_str());
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) { 
@@ -135,19 +127,21 @@ void setup() {
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    startCaptivePortal();
-    return;
+    drawErrorScreen(airports[currentIdx], "Boot Wi-Fi", -1);
+  } else {
+    configTzTime("PST8PDT,M3.2.0/2,M11.1.0/2", "pool.ntp.org");
+    struct tm ti;
+    int ntpTries = 0;
+    while(!getLocalTime(&ti) && ntpTries < 20){ delay(500); ntpTries++; }
+    
+    fetchAndRender(airports[currentIdx]);
+    
+    if (getLocalTime(&ti)) {
+      int win = (ti.tm_min >= 32) ? 32 : 2;
+      lastFetchSlot = ti.tm_hour * 60 + win;
+    }
   }
   
-  configTime(-28800, 3600, "pool.ntp.org");
-  struct tm ti;
-  while(!getLocalTime(&ti)){ delay(500); }
-  
-  fetchAndRender(airports[currentIdx]);
-  
-  if (getLocalTime(&ti)) {
-    lastFetchMinute = (ti.tm_min < 30) ? 0 : 30;
-  }
   lastInteraction = millis(); 
 
   gpio_wakeup_enable((gpio_num_t)BTN_TOP, GPIO_INTR_LOW_LEVEL);
@@ -174,12 +168,14 @@ void loop() {
 
   struct tm ti;
   if (getLocalTime(&ti)) {
-    int currentWindow = (ti.tm_min < 30) ? 0 : 30;
-    bool inWindow = (ti.tm_min >= 0 && ti.tm_min <= 5) || (ti.tm_min >= 30 && ti.tm_min <= 35);
-    
-    if (inWindow && currentWindow != lastFetchMinute) {
-      fetchAndRender(airports[currentIdx]);
-      lastFetchMinute = currentWindow;
+    bool inWindow = (ti.tm_min >= 2 && ti.tm_min <= 7) || (ti.tm_min >= 32 && ti.tm_min <= 37);
+    if (inWindow) {
+      int win = (ti.tm_min >= 32) ? 32 : 2;
+      int currentSlot = ti.tm_hour * 60 + win;
+      if (currentSlot != lastFetchSlot) {
+        fetchAndRender(airports[currentIdx]);
+        lastFetchSlot = currentSlot;
+      }
     }
   }
 
@@ -316,10 +312,12 @@ void loop() {
       int current_sec = ti.tm_sec;
       int seconds_to_next;
 
-      if (current_min < 30) {
-        seconds_to_next = ((29 - current_min) * 60) + (60 - current_sec);
+      if (current_min < 2) {
+        seconds_to_next = ((1 - current_min) * 60) + (60 - current_sec);
+      } else if (current_min < 32) {
+        seconds_to_next = ((31 - current_min) * 60) + (60 - current_sec);
       } else {
-        seconds_to_next = ((59 - current_min) * 60) + (60 - current_sec);
+        seconds_to_next = ((61 - current_min) * 60) + (60 - current_sec);
       }
       sleep_us = (uint64_t)(seconds_to_next + 2) * 1000000ULL; 
     }
@@ -349,14 +347,20 @@ void loadPreferences() {
   String defApts[] = {"KLVK", "KTCY", "KSCK", "KMOD", "KCCR", "KRHV", "KC83", "KSJC", "KOAK", "KPAO"};
   String defTafs[] = {"", "KSCK", "", "", "", "KSJC", "KLVK", "", "", "KSJC"}; 
   String defRwys[] = {"25R/25L, 07L/07R", "26, 08", "29R/29L, 11L/11R", "28R/28L, 10R/10L", "19R/19L, 01R/01L", "31R/31L, 13R/13L", "30, 12", "30L/30R, 12R/12L", "30, 12", "31, 13"};
-  
+  float defLats[]  = {37.6934, 37.6890, 37.8942, 37.6258, 37.9897, 37.3329, 37.8284, 37.3626, 37.7213, 37.4611};
+  float defLons[]  = {-121.8204, -121.4418, -121.2383, -120.9544, -122.0569, -121.8195, -121.6258, -121.9290, -122.2207, -122.1150};
+
   for (int i=0; i<numAirports; i++) {
     String keyApt = "apt" + String(i);
     String keyTaf = "taf" + String(i);
     String keyRwy = "rwy" + String(i);
+    String keyLat = "lat" + String(i);
+    String keyLon = "lon" + String(i);
     airports[i] = prefs.getString(keyApt.c_str(), defApts[i]);
     tafFallbacks[i] = prefs.getString(keyTaf.c_str(), defTafs[i]);
     runways[i] = prefs.getString(keyRwy.c_str(), defRwys[i]);
+    aptLat[i] = prefs.getFloat(keyLat.c_str(), defLats[i]);
+    aptLon[i] = prefs.getFloat(keyLon.c_str(), defLons[i]);
   }
   
   invertedColors = prefs.getBool("inverted", false); 
@@ -446,7 +450,7 @@ void enterConfigMode() {
 
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.mode(WIFI_STA); 
-    WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+    WiFi.setTxPower(WIFI_POWER_15dBm); 
     WiFi.begin(mySSID.c_str(), myPASS.c_str());
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) { 
@@ -514,10 +518,16 @@ void handleSave() {
     String keyApt = "apt" + String(i);
     String keyTaf = "taf" + String(i);
     String keyRwy = "rwy" + String(i);
+    String keyLat = "lat" + String(i);
+    String keyLon = "lon" + String(i);
     
     if (server.hasArg(keyApt)) {
       String valApt = server.arg(keyApt);
       valApt.toUpperCase(); valApt.trim();
+      if (valApt != airports[i]) {
+        prefs.putFloat(keyLat.c_str(), 0.0);
+        prefs.putFloat(keyLon.c_str(), 0.0);
+      }
       prefs.putString(keyApt.c_str(), valApt);
     }
     
@@ -562,13 +572,17 @@ void drawErrorScreen(String icao, String type, int httpCode) {
     display.setCursor(20, 120); 
     display.print("Failed to fetch " + type + " data.");
     display.setCursor(20, 160);
-    if (httpCode < 0) {
-      display.print("Reason: Wi-Fi or DNS failure (" + String(httpCode) + ")");
+    if (httpCode == -11) {
+      display.print("Reason: Server Read Timeout (-11)");
+    } else if (httpCode == 0) {
+      display.print("Reason: Station returned empty report");
+    } else if (httpCode < 0) {
+      display.print("Reason: Wi-Fi or Socket Error (" + String(httpCode) + ")");
     } else {
       display.print("Reason: API returned HTTP " + String(httpCode));
     }
     display.setCursor(20, 220); 
-    display.print("Check your network or select a different airport.");
+    display.print("Will automatically retry on next cycle.");
   } while (display.nextPage());
 }
 
@@ -586,7 +600,7 @@ void fetchAndRender(String icao) {
   if (WiFi.status() != WL_CONNECTED) {
     delay(100); 
     WiFi.mode(WIFI_STA); 
-    WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+    WiFi.setTxPower(WIFI_POWER_15dBm); 
     WiFi.begin(mySSID.c_str(), myPASS.c_str());
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) { 
@@ -595,12 +609,12 @@ void fetchAndRender(String icao) {
     }
     
     if (WiFi.status() != WL_CONNECTED) {
-      startCaptivePortal();
+      drawErrorScreen(icao, "Wi-Fi Connect", -1);
       return; 
     }
     
-    configTime(-28800, 3600, "pool.ntp.org");
-    delay(2000); 
+    configTzTime("PST8PDT,M3.2.0/2,M11.1.0/2", "pool.ntp.org");
+    delay(1500); 
   }
 
   fetchCount++;
@@ -622,39 +636,78 @@ void fetchAndRender(String icao) {
 void fetchMETAR(String icao) {
   bool hasTFR = false;
   int httpCode = -1;
+  String payloadMetar = "";
 
-  HTTPClient httpNotam;
   String notamUrl = "https://aviationweather.gov/api/data/notam?ids=" + icao + "&format=json";
-  httpNotam.begin(notamUrl);
-  httpNotam.setUserAgent("MFD-FlightDeck/1.0 (your_email@example.com)");
-  
-  for (int i = 0; i < 3; i++) {
-    if (httpNotam.GET() == 200) {
-      String payload = httpNotam.getString();
-      if (payload.indexOf("\"TFR\"") != -1 || payload.indexOf("TEMPORARY FLIGHT RESTRICTION") != -1 || payload.indexOf("VIP") != -1) {
-        hasTFR = true;
+  for (int i = 0; i < 2; i++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient httpNotam;
+    httpNotam.useHTTP10(true);
+    if (httpNotam.begin(client, notamUrl)) {
+      httpNotam.setConnectTimeout(5000);
+      httpNotam.setTimeout(10000);
+      httpNotam.setReuse(false);
+      httpNotam.setUserAgent("MFD-FlightDeck/1.0");
+      
+      if (httpNotam.GET() == 200) {
+        String payload = httpNotam.getString();
+        if (payload.indexOf("\"TFR\"") != -1 || payload.indexOf("TEMPORARY FLIGHT RESTRICTION") != -1 || payload.indexOf("VIP") != -1) {
+          hasTFR = true;
+        }
+        httpNotam.end();
+        break;
       }
-      break;
+      httpNotam.end();
     }
-    delay(1000);
+    delay(500);
   }
-  httpNotam.end();
 
-  HTTPClient http;
   String url = "https://aviationweather.gov/api/data/metar?ids=" + icao + "&format=json";
-  http.begin(url);
-  http.setUserAgent("MFD-FlightDeck/1.0 (your_email@example.com)");
-  
   for (int i = 0; i < 3; i++) {
-    httpCode = http.GET();
-    if (httpCode > 0) break; 
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.useHTTP10(true);
+    if (http.begin(client, url)) {
+      http.setConnectTimeout(5000);
+      http.setTimeout(10000);
+      http.setReuse(false);
+      http.setUserAgent("MFD-FlightDeck/1.0");
+      
+      httpCode = http.GET();
+      if (httpCode == 200) {
+        payloadMetar = http.getString();
+        http.end();
+        break; 
+      }
+      Serial.printf("[METAR] Attempt %d failed: %d (%s)\n", i + 1, httpCode, http.errorToString(httpCode).c_str());
+      http.end();
+    }
     delay(1000); 
   }
   
   if (httpCode == 200) {
     DynamicJsonDocument doc(8192);
-    deserializeJson(doc, http.getString());
+    DeserializationError err = deserializeJson(doc, payloadMetar);
+    if (err || doc.size() == 0) {
+      drawErrorScreen(icao, "METAR", 0);
+      return;
+    }
     JsonObject obj = doc[0];
+
+    if (!obj["lat"].isNull() && !obj["lon"].isNull()) {
+      float newLat = obj["lat"].as<float>();
+      float newLon = obj["lon"].as<float>();
+      if (fabs(aptLat[currentIdx] - newLat) > 0.001 || fabs(aptLon[currentIdx] - newLon) > 0.001) {
+        aptLat[currentIdx] = newLat;
+        aptLon[currentIdx] = newLon;
+        prefs.begin("mfd", false);
+        prefs.putFloat(("lat" + String(currentIdx)).c_str(), newLat);
+        prefs.putFloat(("lon" + String(currentIdx)).c_str(), newLon);
+        prefs.end();
+      }
+    }
 
     const char* cat = obj["fltCat"] | "UNK";
     String vis = obj["visib"].isNull() ? "N/A" : obj["visib"].as<String>();
@@ -673,7 +726,7 @@ void fetchMETAR(String icao) {
       display.fillScreen(BG_COLOR); display.setTextColor(FG_COLOR);
       
       struct tm ti; getLocalTime(&ti);
-      char tBuf[40]; strftime(tBuf, sizeof(tBuf), "%a, %b %d %H:%M PDT", &ti);
+      char tBuf[40]; strftime(tBuf, sizeof(tBuf), "%a, %b %d %H:%M %Z", &ti);
       display.setFont(&FreeSans9pt7b); display.setCursor(530, 20); display.print(tBuf);
       
       drawBattery(761, 2);
@@ -731,7 +784,6 @@ void fetchMETAR(String icao) {
       
       String rawStr = String(raw);
       
-      // --- V32.10 BUGFIX: Strip out the remarks section for weather icon parsing ---
       String iconStr = rawStr; 
       int rmkIdx = iconStr.indexOf(" RMK");
       if (rmkIdx > 0) {
@@ -758,7 +810,6 @@ void fetchMETAR(String icao) {
       int iconX = 460; 
       if (cloudStr.length() > 20) iconX = 550; 
       
-      // Pass the cleaned iconStr instead of the full rawStr
       drawWeatherIcon(iconX, 200, iconStr, (ti.tm_hour >= 19 || ti.tm_hour < 6));
       
       drawCompass(660, 160, 65, wdir, wspd, wgst);
@@ -772,28 +823,42 @@ void fetchMETAR(String icao) {
   } else {
     drawErrorScreen(icao, "METAR", httpCode);
   }
-  http.end();
 }
 
 void fetchTAF(String icao) {
-  HTTPClient http;
   int httpCode = -1;
+  String payloadTaf = "";
   
   String target = tafFallbacks[currentIdx];
   if (target == "") target = icao; 
 
-  http.begin("https://aviationweather.gov/api/data/taf?ids=" + target + "&format=json");
-  http.setUserAgent("MFD-FlightDeck/1.0 (your_email@example.com)");
-  
+  String url = "https://aviationweather.gov/api/data/taf?ids=" + target + "&format=json";
   for (int i = 0; i < 3; i++) {
-    httpCode = http.GET();
-    if (httpCode > 0) break; 
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.useHTTP10(true);
+    if (http.begin(client, url)) {
+      http.setConnectTimeout(5000);
+      http.setTimeout(10000);
+      http.setReuse(false);
+      http.setUserAgent("MFD-FlightDeck/1.0");
+      
+      httpCode = http.GET();
+      if (httpCode == 200) {
+        payloadTaf = http.getString();
+        http.end();
+        break; 
+      }
+      Serial.printf("[TAF] Attempt %d failed: %d (%s)\n", i + 1, httpCode, http.errorToString(httpCode).c_str());
+      http.end();
+    }
     delay(1000);
   }
   
   if (httpCode == 200) {
     DynamicJsonDocument doc(16384);
-    deserializeJson(doc, http.getStream());
+    deserializeJson(doc, payloadTaf);
     
     display.setFullWindow(); display.firstPage();
     do {
@@ -832,88 +897,201 @@ void fetchTAF(String icao) {
   } else {
     drawErrorScreen(icao, "TAF", httpCode);
   }
-  http.end();
 }
 
 void fetchWinds(String icao) {
-  float lat = 0.0, lon = 0.0;
-  HTTPClient httpLoc;
-  int locCode = -1;
-  httpLoc.begin("https://aviationweather.gov/api/data/stationinfo?ids=" + icao + "&format=json");
-  httpLoc.setUserAgent("MFD-FlightDeck/1.0 (your_email@example.com)");
-  
-  for (int i = 0; i < 3; i++) {
-    locCode = httpLoc.GET();
-    if (locCode > 0) break;
-    delay(1000);
-  }
-  
-  if (locCode == 200) {
-    DynamicJsonDocument docLoc(1024);
-    deserializeJson(docLoc, httpLoc.getStream());
-    if (docLoc.size() > 0) {
-      lat = docLoc[0]["lat"] | 0.0;
-      lon = docLoc[0]["lon"] | 0.0;
+  float lat = aptLat[currentIdx];
+  float lon = aptLon[currentIdx];
+
+  // Only look up coordinates if a custom slot has 0.0 cached
+  if (lat == 0.0 && lon == 0.0) {
+    String locUrl = "https://aviationweather.gov/api/data/stationinfo?ids=" + icao + "&format=json";
+    WiFiClientSecure sClient;
+    sClient.setInsecure();
+    HTTPClient httpLoc;
+    httpLoc.useHTTP10(true);
+    if (httpLoc.begin(sClient, locUrl)) {
+      httpLoc.setConnectTimeout(5000);
+      httpLoc.setTimeout(10000);
+      httpLoc.setReuse(false);
+      httpLoc.setUserAgent("MFD-FlightDeck/1.0");
+      
+      if (httpLoc.GET() == 200) {
+        DynamicJsonDocument docLoc(2048);
+        deserializeJson(docLoc, httpLoc.getStream());
+        if (docLoc.size() > 0) {
+          lat = docLoc[0]["lat"] | 37.6934;
+          lon = docLoc[0]["lon"] | -121.8204;
+          aptLat[currentIdx] = lat;
+          aptLon[currentIdx] = lon;
+          prefs.begin("mfd", false);
+          prefs.putFloat(("lat" + String(currentIdx)).c_str(), lat);
+          prefs.putFloat(("lon" + String(currentIdx)).c_str(), lon);
+          prefs.end();
+        }
+      }
+      httpLoc.end();
+    }
+
+    if (lat == 0.0 && lon == 0.0) {
+      lat = 37.6934;
+      lon = -121.8204;
     }
   }
-  httpLoc.end();
 
-  String target = getClosestFB(lat, lon);
-
-  HTTPClient http;
+  // V32.17: HTTPS /v1/forecast with useHTTP10(true) set BEFORE begin() & 10s read timeout
   int httpCode = -1;
-  http.begin("https://aviationweather.gov/api/data/windtemp?region=sfo&level=low&fcst=06");
-  http.setUserAgent("MFD-FlightDeck/1.0 (your_email@example.com)");
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = DeserializationError::EmptyInput;
+
+  String windUrl = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) +
+                   "&longitude=" + String(lon, 4) +
+                   "&current=wind_speed_900hPa,wind_direction_900hPa,temperature_900hPa,"
+                   "wind_speed_800hPa,wind_direction_800hPa,temperature_800hPa,"
+                   "wind_speed_700hPa,wind_direction_700hPa,temperature_700hPa,"
+                   "wind_speed_600hPa,wind_direction_600hPa,temperature_600hPa,"
+                   "wind_speed_500hPa,wind_direction_500hPa,temperature_500hPa"
+                   "&wind_speed_unit=kn";
   
   for (int i = 0; i < 3; i++) {
-    httpCode = http.GET();
-    if (httpCode > 0) break;
-    delay(1000);
+    unsigned long t0 = millis();
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.useHTTP10(true);
+    if (http.begin(client, windUrl)) {
+      http.setConnectTimeout(6000);
+      http.setTimeout(10000);
+      http.setReuse(false);
+      http.setUserAgent("MFD-FlightDeck/1.0");
+      
+      httpCode = http.GET();
+      Serial.printf("[WINDS] Attempt %d -> HTTP %d (%s) in %lu ms\n",
+                    i + 1, httpCode, http.errorToString(httpCode).c_str(), millis() - t0);
+      if (httpCode == 200) {
+        err = deserializeJson(doc, http.getStream());
+        http.end();
+        break;
+      }
+      http.end();
+    }
+    delay(800);
   }
   
   if (httpCode == 200) {
-    String p = http.getString();
-    
-    int idx = p.indexOf("\n" + target + " ");
-    String line = (idx != -1) ? p.substring(idx+1, p.indexOf("\n", idx+1)) : "";
-    
+    JsonObject cur = doc["current"];
+
+    int wdir[5], wspd[5];
+    float wtmp[5];
+    const char* spdKeys[] = {"wind_speed_900hPa", "wind_speed_800hPa", "wind_speed_700hPa", "wind_speed_600hPa", "wind_speed_500hPa"};
+    const char* dirKeys[] = {"wind_direction_900hPa", "wind_direction_800hPa", "wind_direction_700hPa", "wind_direction_600hPa", "wind_direction_500hPa"};
+    const char* tmpKeys[] = {"temperature_900hPa", "temperature_800hPa", "temperature_700hPa", "temperature_600hPa", "temperature_500hPa"};
+
+    for (int i = 0; i < 5; i++) {
+      wspd[i] = (int)round(cur[spdKeys[i]] | 0.0);
+      wdir[i] = (int)round(cur[dirKeys[i]] | 0.0);
+      wtmp[i] = cur[tmpKeys[i]] | 0.0;
+    }
+
     display.setFullWindow(); display.firstPage();
     do {
       display.fillScreen(BG_COLOR); display.setTextColor(FG_COLOR);
-      display.setFont(&FreeSansBold18pt7b); display.setCursor(20, 45); display.print(icao + " Winds Aloft (" + target + ")");
+      display.setFont(&FreeSansBold18pt7b);
+      display.setCursor(20, 45);
+      display.print(icao + " Winds Aloft");
+      display.setFont(&FreeSans12pt7b);
+      display.print(" (NOAA GFS Direct)");
       display.drawLine(20, 60, 770, 60, FG_COLOR);
       
       drawBattery(761, 2);
       
-      if (line.length() < 10) {
-        display.setFont(&FreeSans12pt7b); display.setCursor(20, 120); display.print("NO DATA AVAILABLE.");
-      } else {
-        display.setFont(&FreeSansBold12pt7b);
-        int c[] = {20, 130, 250, 370, 500, 630};
-        const char* alts[] = {"Station", "3,000", "6,000", "9,000", "12,000", "18,000"};
-        for(int i=0; i<6; i++) { display.setCursor(c[i], 120); display.print(alts[i]); }
-        display.drawLine(20, 140, 770, 140, FG_COLOR);
-        
+      if (err || cur.isNull()) {
         display.setFont(&FreeSans12pt7b);
-        int tC=0, s=0; line.trim();
-        while(s < line.length() && tC < 6) { 
-          while(s < line.length() && line[s] == ' ') s++;
-          if (s >= line.length()) break;
-          int e = line.indexOf(' ', s); if(e == -1) e = line.length();
-          display.setCursor(c[tC++], 180); display.print(line.substring(s, e));
-          s = e + 1;
+        display.setCursor(20, 120);
+        display.print("NO WINDS DATA AVAILABLE.");
+      } else {
+        int colX[] = {20, 150, 278, 406, 534, 662};
+        const char* headers[] = {"Format", "3,000 ft", "6,000 ft", "10,000 ft", "14,000 ft", "18,000 ft"};
+        
+        display.setFont(&FreeSansBold12pt7b);
+        for (int i = 0; i < 6; i++) {
+          display.setCursor(colX[i], 105);
+          display.print(headers[i]);
         }
+        display.drawLine(20, 120, 770, 120, FG_COLOR);
+        
+        // Row 1: Decoded (e.g., 270°@14kt)
+        display.setFont(&FreeSansBold12pt7b);
+        display.setCursor(colX[0], 165);
+        display.print("Decoded:");
+        for (int i = 0; i < 5; i++) {
+          printWindDecoded(colX[i + 1], 165, wdir[i], wspd[i]);
+        }
+
+        // Row 2: Classic FAA Encoded (e.g., 2714+11)
+        display.setFont(&FreeSansBold12pt7b);
+        display.setCursor(colX[0], 215);
+        display.print("FAA Fmt:");
+        display.setFont(&FreeSans12pt7b);
+        for (int i = 0; i < 5; i++) {
+          display.setCursor(colX[i + 1], 215);
+          display.print(formatFAAWind(wdir[i], wspd[i], wtmp[i]));
+        }
+
+        // Footer metadata
+        display.drawLine(20, 238, 770, 238, FG_COLOR);
+        display.setFont(&FreeSans9pt7b);
+        display.setCursor(20, 262);
+        char metaBuf[90];
+        sprintf(metaBuf, "Model: NOAA HRRR/GFS (%.2f, %.2f) | Pressure Levels: 900-500 hPa", lat, lon);
+        display.print(metaBuf);
       }
     } while (display.nextPage());
   } else {
     drawErrorScreen(icao, "Winds Aloft", httpCode);
   }
-  http.end();
 }
 
 // ==========================================
 // STRING EXPANDERS & DRAWING LOGIC 
 // ==========================================
+
+void printWindDecoded(int x, int y, int dir, int spd) {
+  display.setFont(&FreeSans9pt7b);
+  char dirBuf[6];
+  sprintf(dirBuf, "%03d", dir);
+  display.setCursor(x, y);
+  display.print(dirBuf);
+
+  int16_t bx, by; uint16_t bw, bh;
+  display.getTextBounds(dirBuf, x, y, &bx, &by, &bw, &bh);
+  
+  display.drawCircle(x + bw + 4, y - 10, 2, FG_COLOR);
+  
+  char spdBuf[12];
+  sprintf(spdBuf, "@%dkt", spd);
+  display.setCursor(x + bw + 8, y);
+  display.print(spdBuf);
+}
+
+String formatFAAWind(int dir, int spd, float temp) {
+  int dd = ((dir + 5) / 10) % 36;
+  if (dd == 0) dd = 36;
+  int ss = spd;
+
+  if (ss < 5) {
+    dd = 99;
+    ss = 0;
+  } else if (ss >= 100) {
+    dd += 50;
+    ss -= 100;
+  }
+
+  int tt = (int)round(temp);
+  char buf[16];
+  sprintf(buf, "%02d%02d%+03d", dd, ss, tt);
+  return String(buf);
+}
 
 void drawBattery(int x, int y) {
   float pct = 1.0 - ((float)fetchCount / (float)MAX_FETCHES);
@@ -925,29 +1103,6 @@ void drawBattery(int x, int y) {
   if (pct > 0.66) display.fillRect(x + 5, y + 2, 7, 8, FG_COLOR);  
   if (pct > 0.33) display.fillRect(x + 13, y + 2, 6, 8, FG_COLOR); 
   if (pct > 0.05) display.fillRect(x + 20, y + 2, 7, 8, FG_COLOR); 
-}
-
-float getDistance(float lat1, float lon1, float lat2, float lon2) {
-  float R = 3440.065; 
-  float dLat = (lat2 - lat1) * M_PI / 180.0;
-  float dLon = (lon2 - lon1) * M_PI / 180.0;
-  float a = sin(dLat/2) * sin(dLat/2) + cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) * sin(dLon/2) * sin(dLon/2);
-  float c = 2 * atan2(sqrt(a), sqrt(1-a));
-  return R * c;
-}
-
-String getClosestFB(float lat, float lon) {
-  if (lat == 0.0 && lon == 0.0) return "SFO"; 
-  String bestID = "SFO";
-  float minDist = 99999.0;
-  for (int i=0; i<6; i++) {
-    float d = getDistance(lat, lon, fbStations[i].lat, fbStations[i].lon);
-    if (d < minDist) {
-      minDist = d;
-      bestID = fbStations[i].id;
-    }
-  }
-  return bestID;
 }
 
 String formatAlt(int feet) {
@@ -1022,7 +1177,7 @@ void drawWeatherIcon(int x, int y, String raw, bool isNight) {
     
     int cloudBelly = y + 26;
     int len = 15; 
-    int ang = 15; // V32.10: Updated to 15 degrees for forward slashes "\"
+    int ang = 15; 
 
     drawEinkSlash(x - 22, cloudBelly + 3, len, ang);
     drawEinkSlash(x - 12, cloudBelly + 6, len, ang);
