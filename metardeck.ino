@@ -14,6 +14,8 @@
 #include <Fonts/FreeSans12pt7b.h> 
 #include <Fonts/FreeSans9pt7b.h>
 
+#define FW_VERSION "V33.0"
+
 // --- USER CONFIG ---
 String mySSID = "";
 String myPASS = "";
@@ -29,6 +31,7 @@ int weatherMode = 0; // 0=METAR, 1=TAF, 2=WINDS
 
 bool inConfigMode = false;
 bool inWifiSetup = false;
+bool ntpSynced = false;
 int lastFetchSlot = -1; 
 bool invertedColors = false; 
 unsigned long lastFetchTime = 0;
@@ -70,6 +73,7 @@ GxEPD2_BW<GxEPD2_579_GDEY0579T93, GxEPD2_579_GDEY0579T93::HEIGHT> display(GxEPD2
 
 // Forward Declarations
 void loadPreferences();
+void syncNTP();
 void enterConfigMode();
 void startCaptivePortal();
 void handleRoot();
@@ -86,7 +90,6 @@ void drawWeatherIcon(int x, int y, String raw, bool isNight);
 void drawEinkSlash(int px, int py, int len, int ang); 
 void drawWindsock(int px, int py, int wdir, int wspd);
 void drawCompass(int cx, int cy, int r, int wdir, int wspd, int wgst);
-void drawTFRIndicator(int cx, int cy);
 void drawWaterDrop(int x, int y, int r); 
 void drawBattery(int x, int y);
 void drawErrorScreen(String icao, String type, int httpCode);
@@ -100,6 +103,8 @@ String formatAlt(int feet);
 
 void setup() {
   Serial.begin(115200);
+  Serial.printf("\n--- MFD Flight Deck %s Booting ---\n", FW_VERSION);
+
   pinMode(EPD_PWR_EN, OUTPUT); 
   pinMode(BTN_TOP, INPUT_PULLUP); pinMode(BTN_BOTTOM, INPUT_PULLUP);
   pinMode(ROCKER_UP, INPUT_PULLUP); pinMode(ROCKER_DOWN, INPUT_PULLUP); pinMode(ROCKER_IN, INPUT_PULLUP);
@@ -118,7 +123,8 @@ void setup() {
   }
   
   WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_15dBm); 
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
   WiFi.begin(mySSID.c_str(), myPASS.c_str());
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) { 
@@ -129,14 +135,11 @@ void setup() {
   if (WiFi.status() != WL_CONNECTED) {
     drawErrorScreen(airports[currentIdx], "Boot Wi-Fi", -1);
   } else {
-    configTzTime("PST8PDT,M3.2.0/2,M11.1.0/2", "pool.ntp.org");
-    struct tm ti;
-    int ntpTries = 0;
-    while(!getLocalTime(&ti) && ntpTries < 20){ delay(500); ntpTries++; }
-    
+    syncNTP();
     fetchAndRender(airports[currentIdx]);
     
-    if (getLocalTime(&ti)) {
+    struct tm ti;
+    if (getLocalTime(&ti, 50)) {
       int win = (ti.tm_min >= 32) ? 32 : 2;
       lastFetchSlot = ti.tm_hour * 60 + win;
     }
@@ -150,6 +153,21 @@ void setup() {
   gpio_wakeup_enable((gpio_num_t)ROCKER_DOWN, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable((gpio_num_t)ROCKER_IN, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
+}
+
+void syncNTP() {
+  configTzTime("PST8PDT,M3.2.0/2,M11.1.0/2", "pool.ntp.org");
+  struct tm ti;
+  int ntpTries = 0;
+  while (!getLocalTime(&ti, 500) && ntpTries < 10) {
+    ntpTries++;
+  }
+  if (getLocalTime(&ti, 50)) {
+    ntpSynced = true;
+    Serial.println("[NTP] Synced successfully");
+  } else {
+    Serial.println("[NTP] Sync timed out");
+  }
 }
 
 void loop() {
@@ -167,7 +185,7 @@ void loop() {
   }
 
   struct tm ti;
-  if (getLocalTime(&ti)) {
+  if (getLocalTime(&ti, 50)) {
     bool inWindow = (ti.tm_min >= 2 && ti.tm_min <= 7) || (ti.tm_min >= 32 && ti.tm_min <= 37);
     if (inWindow) {
       int win = (ti.tm_min >= 32) ? 32 : 2;
@@ -307,7 +325,7 @@ void loop() {
     WiFi.mode(WIFI_OFF);
 
     uint64_t sleep_us = 60 * 1000000ULL; 
-    if (getLocalTime(&ti)) {
+    if (getLocalTime(&ti, 50)) {
       int current_min = ti.tm_min;
       int current_sec = ti.tm_sec;
       int seconds_to_next;
@@ -450,7 +468,8 @@ void enterConfigMode() {
 
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.mode(WIFI_STA); 
-    WiFi.setTxPower(WIFI_POWER_15dBm); 
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm); 
     WiFi.begin(mySSID.c_str(), myPASS.c_str());
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) { 
@@ -574,7 +593,7 @@ void drawErrorScreen(String icao, String type, int httpCode) {
     display.setCursor(20, 160);
     if (httpCode == -11) {
       display.print("Reason: Server Read Timeout (-11)");
-    } else if (httpCode == 0) {
+    } else if (httpCode == 0 || httpCode == 204) {
       display.print("Reason: Station returned empty report");
     } else if (httpCode < 0) {
       display.print("Reason: Wi-Fi or Socket Error (" + String(httpCode) + ")");
@@ -600,7 +619,8 @@ void fetchAndRender(String icao) {
   if (WiFi.status() != WL_CONNECTED) {
     delay(100); 
     WiFi.mode(WIFI_STA); 
-    WiFi.setTxPower(WIFI_POWER_15dBm); 
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm); 
     WiFi.begin(mySSID.c_str(), myPASS.c_str());
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) { 
@@ -612,9 +632,11 @@ void fetchAndRender(String icao) {
       drawErrorScreen(icao, "Wi-Fi Connect", -1);
       return; 
     }
-    
-    configTzTime("PST8PDT,M3.2.0/2,M11.1.0/2", "pool.ntp.org");
-    delay(1500); 
+
+    // V33.0: Only sync NTP if not yet synced or once every 24h (48 cycles)
+    if (!ntpSynced || (fetchCount > 0 && fetchCount % 48 == 0)) {
+      syncNTP();
+    }
   }
 
   fetchCount++;
@@ -634,55 +656,37 @@ void fetchAndRender(String icao) {
 }
 
 void fetchMETAR(String icao) {
-  bool hasTFR = false;
   int httpCode = -1;
   String payloadMetar = "";
-
-  String notamUrl = "https://aviationweather.gov/api/data/notam?ids=" + icao + "&format=json";
-  for (int i = 0; i < 2; i++) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient httpNotam;
-    httpNotam.useHTTP10(true);
-    if (httpNotam.begin(client, notamUrl)) {
-      httpNotam.setConnectTimeout(5000);
-      httpNotam.setTimeout(10000);
-      httpNotam.setReuse(false);
-      httpNotam.setUserAgent("MFD-FlightDeck/1.0");
-      
-      if (httpNotam.GET() == 200) {
-        String payload = httpNotam.getString();
-        if (payload.indexOf("\"TFR\"") != -1 || payload.indexOf("TEMPORARY FLIGHT RESTRICTION") != -1 || payload.indexOf("VIP") != -1) {
-          hasTFR = true;
-        }
-        httpNotam.end();
-        break;
-      }
-      httpNotam.end();
-    }
-    delay(500);
-  }
-
   String url = "https://aviationweather.gov/api/data/metar?ids=" + icao + "&format=json";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(10);
+
   for (int i = 0; i < 3; i++) {
-    WiFiClientSecure client;
-    client.setInsecure();
+    unsigned long t0 = millis();
     HTTPClient http;
-    http.useHTTP10(true);
     if (http.begin(client, url)) {
-      http.setConnectTimeout(5000);
+      http.setConnectTimeout(6000);
       http.setTimeout(10000);
       http.setReuse(false);
-      http.setUserAgent("MFD-FlightDeck/1.0");
+      http.addHeader("Accept-Encoding", "identity");
+      http.setUserAgent("MFD-FlightDeck/33.0");
       
       httpCode = http.GET();
+      Serial.printf("[METAR] Try %d -> HTTP %d (%s) | %lu ms | RSSI %d | Heap %u\n",
+                    i + 1, httpCode, http.errorToString(httpCode).c_str(),
+                    millis() - t0, WiFi.RSSI(), ESP.getFreeHeap());
       if (httpCode == 200) {
         payloadMetar = http.getString();
         http.end();
+        client.stop();
         break; 
       }
-      Serial.printf("[METAR] Attempt %d failed: %d (%s)\n", i + 1, httpCode, http.errorToString(httpCode).c_str());
       http.end();
+      client.stop();
+      if (httpCode == 204 || httpCode == 404) break;
     }
     delay(1000); 
   }
@@ -725,9 +729,12 @@ void fetchMETAR(String icao) {
     do {
       display.fillScreen(BG_COLOR); display.setTextColor(FG_COLOR);
       
-      struct tm ti; getLocalTime(&ti);
-      char tBuf[40]; strftime(tBuf, sizeof(tBuf), "%a, %b %d %H:%M %Z", &ti);
-      display.setFont(&FreeSans9pt7b); display.setCursor(530, 20); display.print(tBuf);
+      struct tm ti;
+      bool hasTime = getLocalTime(&ti, 50);
+      if (hasTime) {
+        char tBuf[40]; strftime(tBuf, sizeof(tBuf), "%a, %b %d %H:%M %Z", &ti);
+        display.setFont(&FreeSans9pt7b); display.setCursor(530, 20); display.print(tBuf);
+      }
       
       drawBattery(761, 2);
 
@@ -783,7 +790,6 @@ void fetchMETAR(String icao) {
       drawWaterDrop(400 + bw + 15, 142, 7); 
       
       String rawStr = String(raw);
-      
       String iconStr = rawStr; 
       int rmkIdx = iconStr.indexOf(" RMK");
       if (rmkIdx > 0) {
@@ -804,18 +810,16 @@ void fetchMETAR(String icao) {
         }
       }
       display.setCursor(20, 195); display.print("Clouds: " + cloudStr);
-      
       display.setCursor(20, 240); display.print("Active Rwy: " + getBestRunway(icao, wdir, currentIdx));
 
       int iconX = 460; 
       if (cloudStr.length() > 20) iconX = 550; 
       
-      drawWeatherIcon(iconX, 200, iconStr, (ti.tm_hour >= 19 || ti.tm_hour < 6));
+      bool isNight = hasTime ? (ti.tm_hour >= 19 || ti.tm_hour < 6) : false;
+      drawWeatherIcon(iconX, 200, iconStr, isNight);
       
       drawCompass(660, 160, 65, wdir, wspd, wgst);
       drawWindsock(750, 40, wdir, wspd);
-      
-      if (hasTFR) drawTFRIndicator(660, 30);
       
       display.setFont(&FreeSans9pt7b);
       display.setCursor(20, 270); display.print(rawStr);
@@ -833,25 +837,34 @@ void fetchTAF(String icao) {
   if (target == "") target = icao; 
 
   String url = "https://aviationweather.gov/api/data/taf?ids=" + target + "&format=json";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(10);
+
   for (int i = 0; i < 3; i++) {
-    WiFiClientSecure client;
-    client.setInsecure();
+    unsigned long t0 = millis();
     HTTPClient http;
-    http.useHTTP10(true);
     if (http.begin(client, url)) {
-      http.setConnectTimeout(5000);
+      http.setConnectTimeout(6000);
       http.setTimeout(10000);
       http.setReuse(false);
-      http.setUserAgent("MFD-FlightDeck/1.0");
+      http.addHeader("Accept-Encoding", "identity");
+      http.setUserAgent("MFD-FlightDeck/33.0");
       
       httpCode = http.GET();
+      Serial.printf("[TAF] Try %d -> HTTP %d (%s) | %lu ms | RSSI %d | Heap %u\n",
+                    i + 1, httpCode, http.errorToString(httpCode).c_str(),
+                    millis() - t0, WiFi.RSSI(), ESP.getFreeHeap());
       if (httpCode == 200) {
         payloadTaf = http.getString();
         http.end();
+        client.stop();
         break; 
       }
-      Serial.printf("[TAF] Attempt %d failed: %d (%s)\n", i + 1, httpCode, http.errorToString(httpCode).c_str());
       http.end();
+      client.stop();
+      if (httpCode == 204 || httpCode == 404) break;
     }
     delay(1000);
   }
@@ -903,22 +916,25 @@ void fetchWinds(String icao) {
   float lat = aptLat[currentIdx];
   float lon = aptLon[currentIdx];
 
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(10);
+
   // Only look up coordinates if a custom slot has 0.0 cached
   if (lat == 0.0 && lon == 0.0) {
     String locUrl = "https://aviationweather.gov/api/data/stationinfo?ids=" + icao + "&format=json";
-    WiFiClientSecure sClient;
-    sClient.setInsecure();
     HTTPClient httpLoc;
-    httpLoc.useHTTP10(true);
-    if (httpLoc.begin(sClient, locUrl)) {
-      httpLoc.setConnectTimeout(5000);
+    if (httpLoc.begin(client, locUrl)) {
+      httpLoc.setConnectTimeout(6000);
       httpLoc.setTimeout(10000);
       httpLoc.setReuse(false);
-      httpLoc.setUserAgent("MFD-FlightDeck/1.0");
+      httpLoc.addHeader("Accept-Encoding", "identity");
+      httpLoc.setUserAgent("MFD-FlightDeck/33.0");
       
       if (httpLoc.GET() == 200) {
+        String payloadLoc = httpLoc.getString();
         DynamicJsonDocument docLoc(2048);
-        deserializeJson(docLoc, httpLoc.getStream());
+        deserializeJson(docLoc, payloadLoc);
         if (docLoc.size() > 0) {
           lat = docLoc[0]["lat"] | 37.6934;
           lon = docLoc[0]["lon"] | -121.8204;
@@ -931,6 +947,7 @@ void fetchWinds(String icao) {
         }
       }
       httpLoc.end();
+      client.stop();
     }
 
     if (lat == 0.0 && lon == 0.0) {
@@ -939,11 +956,8 @@ void fetchWinds(String icao) {
     }
   }
 
-  // V32.17: HTTPS /v1/forecast with useHTTP10(true) set BEFORE begin() & 10s read timeout
   int httpCode = -1;
-  DynamicJsonDocument doc(4096);
-  DeserializationError err = DeserializationError::EmptyInput;
-
+  String payloadWinds = "";
   String windUrl = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) +
                    "&longitude=" + String(lon, 4) +
                    "&current=wind_speed_900hPa,wind_direction_900hPa,temperature_900hPa,"
@@ -955,30 +969,34 @@ void fetchWinds(String icao) {
   
   for (int i = 0; i < 3; i++) {
     unsigned long t0 = millis();
-    WiFiClientSecure client;
-    client.setInsecure();
     HTTPClient http;
-    http.useHTTP10(true);
     if (http.begin(client, windUrl)) {
       http.setConnectTimeout(6000);
       http.setTimeout(10000);
       http.setReuse(false);
-      http.setUserAgent("MFD-FlightDeck/1.0");
+      http.addHeader("Accept-Encoding", "identity");
+      http.setUserAgent("MFD-FlightDeck/33.0");
       
       httpCode = http.GET();
-      Serial.printf("[WINDS] Attempt %d -> HTTP %d (%s) in %lu ms\n",
-                    i + 1, httpCode, http.errorToString(httpCode).c_str(), millis() - t0);
+      Serial.printf("[WINDS] Try %d -> HTTP %d (%s) | %lu ms | RSSI %d | Heap %u\n",
+                    i + 1, httpCode, http.errorToString(httpCode).c_str(),
+                    millis() - t0, WiFi.RSSI(), ESP.getFreeHeap());
       if (httpCode == 200) {
-        err = deserializeJson(doc, http.getStream());
+        payloadWinds = http.getString();
         http.end();
+        client.stop();
         break;
       }
       http.end();
+      client.stop();
+      if (httpCode == 400 || httpCode == 404) break;
     }
-    delay(800);
+    delay(1000);
   }
   
   if (httpCode == 200) {
+    DynamicJsonDocument doc(4096);
+    DeserializationError err = deserializeJson(doc, payloadWinds);
     JsonObject cur = doc["current"];
 
     int wdir[5], wspd[5];
@@ -1329,16 +1347,6 @@ void drawCompass(int cx, int cy, int r, int wdir, int wspd, int wgst) {
     int y3 = cy + (r - 26) * sin(rad + 0.15);
     display.fillTriangle(x1, y1, x2, y2, x3, y3, FG_COLOR);
   }
-}
-
-void drawTFRIndicator(int cx, int cy) {
-  display.drawRect(cx - 45, cy, 90, 30, FG_COLOR);
-  display.drawRect(cx - 44, cy + 1, 88, 28, FG_COLOR); 
-  display.setFont(&FreeSansBold12pt7b);
-  int16_t bx, by; uint16_t bw, bh;
-  display.getTextBounds("TFR", 0, 0, &bx, &by, &bw, &bh);
-  display.setCursor(cx - (bw / 2), cy + (30/2) + (bh/2) - 2); 
-  display.print("TFR");
 }
 
 String getBestRunway(String icao, int wdir, int aptIdx) {
